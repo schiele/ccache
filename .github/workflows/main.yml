@@ -1,0 +1,53 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  push:
+    branches: [ workflow ]
+  pull_request:
+    branches: [ workflow ]
+
+jobs:
+  linux_gcc_separate_build_directory:
+    runs-on: ubuntu-latest
+    steps:
+    - name: prerequisites
+      run: sudo apt-get install elfutils libzstd1-dev libb2-dev
+    - uses: actions/checkout@v2
+    - name: build
+      run: |
+        ./autogen.sh
+        test -z $BUILD_DIR || { mkdir -p $BUILD_DIR; cd $BUILD_DIR; }
+        ${SRC_DIR:-.}/configure $CONFIGURE
+        test "$NO_COMPILE" || make
+        make ${TEST:-test}
+      env:
+        T: "Linux GCC, separate build directory"
+        V: 1
+        ENABLE_CACHE_CLEANUP_TESTS: 1
+        BUILD_DIR: build
+        SRC_DIR: ..
+  linux_gcc_32_bit:
+    runs-on: ubuntu-latest
+    steps:
+    - name: prerequisites
+      run: sudo apt-get install gcc-multilib g++-multilib lib32stdc++-5-dev
+    - uses: actions/checkout@v2
+    - name: build
+      run: |
+        ./autogen.sh
+        test -z $BUILD_DIR || { mkdir -p $BUILD_DIR; cd $BUILD_DIR; }
+        ${SRC_DIR:-.}/configure $CONFIGURE
+        test "$NO_COMPILE" || make
+        make ${TEST:-test}
+      env:
+        T: "Linux GCC 32-bit"
+        V: 1
+        CFLAGS: "-m32 -g -O2"
+        CXXFLAGS: "-m32 -g -O2"
+        LDFLAGS: "-m32"
+        CONFIGURE: "--host=i386-linux-gnu --with-libzstd-from-internet --with-libb2-from-internet"
+        ENABLE_CACHE_CLEANUP_TESTS: 1
