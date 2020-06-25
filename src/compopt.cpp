@@ -40,7 +40,7 @@
 // run_second_cpp is false.
 #define AFFECTS_CPP (1 << 5)
 
-// The option only affects compilation; not passed to the preprocesor.
+// The option only affects compilation; not passed to the preprocessor.
 #define AFFECTS_COMP (1 << 6)
 
 struct compopt
@@ -50,6 +50,7 @@ struct compopt
 };
 
 static const struct compopt compopts[] = {
+  {"--Werror", TAKES_ARG},                            // nvcc
   {"--analyze", TOO_HARD},                            // Clang
   {"--compiler-bindir", AFFECTS_CPP | TAKES_ARG},     // nvcc
   {"--libdevice-directory", AFFECTS_CPP | TAKES_ARG}, // nvcc
@@ -144,16 +145,16 @@ static const struct compopt compopts[] = {
 static int
 compare_compopts(const void* key1, const void* key2)
 {
-  const struct compopt* opt1 = (const struct compopt*)key1;
-  const struct compopt* opt2 = (const struct compopt*)key2;
+  const struct compopt* opt1 = static_cast<const struct compopt*>(key1);
+  const struct compopt* opt2 = static_cast<const struct compopt*>(key2);
   return strcmp(opt1->name, opt2->name);
 }
 
 static int
 compare_prefix_compopts(const void* key1, const void* key2)
 {
-  const struct compopt* opt1 = (const struct compopt*)key1;
-  const struct compopt* opt2 = (const struct compopt*)key2;
+  const struct compopt* opt1 = static_cast<const struct compopt*>(key1);
+  const struct compopt* opt2 = static_cast<const struct compopt*>(key2);
   return strncmp(opt1->name, opt2->name, strlen(opt2->name));
 }
 

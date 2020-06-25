@@ -17,6 +17,7 @@
 // Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 #include "../src/Config.hpp"
+#include "../src/Fd.hpp"
 #include "../src/Util.hpp"
 #include "TestUtil.hpp"
 
@@ -129,6 +130,60 @@ TEST_CASE("Util::dir_name")
   CHECK(Util::dir_name("/foo/bar/f.txt") == "/foo/bar");
 }
 
+TEST_CASE("Util::{edit,strip}_ansi_csi_seqs")
+{
+  static constexpr auto input =
+    "Normal, "
+    "\x1B[K\x1B[1mbold\x1B[m, "
+    "\x1B[31mred\x1B[m, "
+    "\x1B[1;32mbold green\x1B[m.\n";
+
+  SECTION("Remove bold attributes")
+  {
+    CHECK(Util::edit_ansi_csi_seqs(input,
+              [](nonstd::string_view::size_type,
+                 std::string& substr)
+              {
+                if (substr.size() > 3 && substr.back() == 'm') {
+                  nonstd::string_view attrs = substr;
+                  attrs.remove_prefix(2); // ESC [
+                  attrs.remove_suffix(1); // m
+                  std::string edited;
+                  edited.reserve(attrs.size());
+                  for (auto& attr : Util::split_into_views(attrs, ";")) {
+                    if (attr != "1") {
+                      if (!edited.empty()) {
+                        edited += ';';
+                      }
+                      edited.append(attr.begin(), attr.end());
+                    }
+                  }
+                  if (edited.empty()) {
+                    substr.clear();
+                  } else {
+                    substr.replace(2, attrs.size(), std::move(edited));
+                  }
+                }
+              }) ==
+          "Normal, "
+          "\x1B[Kbold\x1B[m, "
+          "\x1B[31mred\x1B[m, "
+          "\x1B[32mbold green\x1B[m.\n");
+  }
+
+  SECTION("Strip SGR sequences only")
+  {
+    CHECK(Util::strip_ansi_csi_seqs(input, "m")
+          == "Normal, \x1B[Kbold, red, bold green.\n");
+  }
+
+  SECTION("Strip default set of CSI sequences")
+  {
+    CHECK(Util::strip_ansi_csi_seqs(input)
+          == "Normal, bold, red, bold green.\n");
+  }
+}
+
 TEST_CASE("Util::ends_with")
 {
   CHECK(Util::ends_with("", ""));
@@ -145,6 +200,27 @@ TEST_CASE("Util::ends_with")
   CHECK_FALSE(Util::ends_with("", "x"));
   CHECK_FALSE(Util::ends_with("x", "y"));
   CHECK_FALSE(Util::ends_with("x", "xy"));
+}
+
+TEST_CASE("Util::fallocate")
+{
+  TestContext test_context;
+
+  const char filename[] = "test-file";
+
+  CHECK(Util::fallocate(Fd(creat(filename, S_IRUSR | S_IWUSR)).get(), 10000)
+        == 0);
+  CHECK(Stat::stat(filename).size() == 10000);
+
+  CHECK(
+    Util::fallocate(Fd(open(filename, O_RDWR, S_IRUSR | S_IWUSR)).get(), 5000)
+    == 0);
+  CHECK(Stat::stat(filename).size() == 10000);
+
+  CHECK(
+    Util::fallocate(Fd(open(filename, O_RDWR, S_IRUSR | S_IWUSR)).get(), 20000)
+    == 0);
+  CHECK(Stat::stat(filename).size() == 20000);
 }
 
 TEST_CASE("Util::for_each_level_1_subdir")
@@ -176,6 +252,17 @@ TEST_CASE("Util::for_each_level_1_subdir")
     "cache_dir/f",
   };
   CHECK(actual == expected);
+}
+
+TEST_CASE("format_hex")
+{
+  uint8_t none[] = "";
+  uint8_t text[4] = "foo"; // incl. NUL
+  uint8_t data[4] = {0, 1, 2, 3};
+
+  CHECK(Util::format_hex(none, 0) == "");
+  CHECK(Util::format_hex(text, sizeof(text)) == "666f6f00");
+  CHECK(Util::format_hex(data, sizeof(data)) == "00010203");
 }
 
 TEST_CASE("Util::get_extension")

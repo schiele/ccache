@@ -19,38 +19,27 @@
 
 #include "hash.hpp"
 
-#include "legacy_util.hpp"
+#include "Fd.hpp"
+#include "Util.hpp"
 #include "logging.hpp"
 
-#include <blake2.h>
+#include "third_party/blake3/blake3.h"
 
 #define HASH_DELIMITER "\000cCaChE"
 
 struct hash
 {
-  blake2b_state state;
+  blake3_hasher hasher;
   FILE* debug_binary;
   FILE* debug_text;
 };
-
-void
-digest_as_string(const struct digest* d, char* buffer)
-{
-  format_hex(d->bytes, DIGEST_SIZE, buffer);
-}
-
-bool
-digests_equal(const struct digest* d1, const struct digest* d2)
-{
-  return memcmp(d1->bytes, d2->bytes, DIGEST_SIZE) == 0;
-}
 
 static void
 do_hash_buffer(struct hash* hash, const void* s, size_t len)
 {
   assert(s);
 
-  blake2b_update(&hash->state, (const uint8_t*)s, len);
+  blake3_hasher_update(&hash->hasher, s, len);
   if (len > 0 && hash->debug_binary) {
     (void)fwrite(s, 1, len, hash->debug_binary);
   }
@@ -68,7 +57,7 @@ struct hash*
 hash_init()
 {
   auto hash = static_cast<struct hash*>(malloc(sizeof(struct hash)));
-  blake2b_init(&hash->state, DIGEST_SIZE);
+  blake3_hasher_init(&hash->hasher);
   hash->debug_binary = nullptr;
   hash->debug_text = nullptr;
   return hash;
@@ -78,7 +67,7 @@ struct hash*
 hash_copy(struct hash* hash)
 {
   auto result = static_cast<struct hash*>(malloc(sizeof(struct hash)));
-  result->state = hash->state;
+  result->hasher = hash->hasher;
   result->debug_binary = nullptr;
   result->debug_text = nullptr;
   return result;
@@ -111,21 +100,26 @@ hash_buffer(struct hash* hash, const void* s, size_t len)
   do_debug_text(hash, s, len);
 }
 
-void
-hash_result_as_bytes(struct hash* hash, struct digest* digest)
+Digest
+hash_buffer_once(const void* s, size_t len)
 {
-  // make a copy before altering state
-  struct hash* copy = hash_copy(hash);
-  blake2b_final(&copy->state, digest->bytes, DIGEST_SIZE);
-  hash_free(copy);
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
+  blake3_hasher_update(&hasher, s, len);
+
+  Digest digest;
+  blake3_hasher_finalize(&hasher, digest.bytes(), digest.size());
+  return digest;
 }
 
-void
-hash_result_as_string(struct hash* hash, char* buffer)
+Digest
+hash_result(struct hash* hash)
 {
-  struct digest d;
-  hash_result_as_bytes(hash, &d);
-  digest_as_string(&d, buffer);
+  // Note that blake3_hasher_finalize doesn't modify the hasher itself, thus it
+  // is possible to finalize again after more data has been added.
+  Digest digest;
+  blake3_hasher_finalize(&hash->hasher, digest.bytes(), digest.size());
+  return digest;
 }
 
 void
@@ -166,7 +160,7 @@ hash_string_buffer(struct hash* hash, const char* s, size_t length)
 void
 hash_int(struct hash* hash, int x)
 {
-  do_hash_buffer(hash, (char*)&x, sizeof(x));
+  do_hash_buffer(hash, reinterpret_cast<const char*>(&x), sizeof(x));
 
   char buf[16];
   snprintf(buf, sizeof(buf), "%d", x);
@@ -198,13 +192,12 @@ hash_fd(struct hash* hash, int fd, bool fd_is_file)
 bool
 hash_file(struct hash* hash, const char* fname)
 {
-  int fd = open(fname, O_RDONLY | O_BINARY);
-  if (fd == -1) {
+  Fd fd(open(fname, O_RDONLY | O_BINARY));
+  if (!fd) {
     cc_log("Failed to open %s: %s", fname, strerror(errno));
     return false;
   }
 
-  bool ret = hash_fd(hash, fd, true);
-  close(fd);
+  bool ret = hash_fd(hash, *fd, true);
   return ret;
 }

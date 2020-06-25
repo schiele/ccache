@@ -33,13 +33,15 @@
 
 namespace Util {
 
-using ProgressReceiver = std::function<void(double)>;
+using ProgressReceiver = std::function<void(double /*progress*/)>;
 using CacheFileVisitor = std::function<void(std::shared_ptr<CacheFile>)>;
 using SubdirVisitor =
   std::function<void(const std::string& /*dir_path*/,
                      const ProgressReceiver& /*progress_receiver*/)>;
 using TraverseVisitor =
   std::function<void(const std::string& path, bool is_dir)>;
+using SubstringEditor =
+  std::function<void(nonstd::string_view::size_type pos, std::string& substr)>;
 
 enum class UnlinkLog { log_failure, ignore_failure };
 
@@ -104,8 +106,23 @@ std::pair<int, std::string> create_temp_fd(nonstd::string_view path_prefix);
 // Get directory name of path.
 nonstd::string_view dir_name(nonstd::string_view path);
 
+// Returns a copy of string with any contained ANSI CSI sequences edited by the
+// given SubstringEditor, which is invoked once for each ANSI CSI sequence
+// encountered in string. The original string is not modified.
+[[gnu::warn_unused_result]] std::string
+edit_ansi_csi_seqs(nonstd::string_view string, const SubstringEditor& editor);
+
 // Return true if suffix is a suffix of string.
 bool ends_with(nonstd::string_view string, nonstd::string_view suffix);
+
+// Extends file size to at least new_size by calling posix_fallocate() if
+// supported, otherwise by writing zeros last to the file.
+//
+// Note that existing holes are not filled in case posix_fallocate() is not
+// supported.
+//
+// Returns 0 on success, an error number otherwise.
+int fallocate(int fd, long new_size);
 
 // Call a function for each subdir (0-9a-f) in the cache.
 //
@@ -117,6 +134,10 @@ bool ends_with(nonstd::string_view string, nonstd::string_view suffix);
 void for_each_level_1_subdir(const std::string& cache_dir,
                              const SubdirVisitor& visitor,
                              const ProgressReceiver& progress_receiver);
+
+// Format a hexadecimal string representing `size` bytes of `data`. The returned
+// string will be `2 * size` long.
+std::string format_hex(const uint8_t* data, size_t size);
 
 // Return current working directory (CWD) as returned from getcwd(3) (i.e.,
 // normalized path without symlink parts). Returns the empty string on error.
@@ -209,6 +230,14 @@ int_to_big_endian(int8_t value, uint8_t* buffer)
 // Return whether `path` is absolute.
 bool is_absolute_path(nonstd::string_view path);
 
+// Test if a file is on nfs.
+//
+// Sets is_nfs to the result if fstatfs is available and no error occurred.
+//
+// Returns 0 if is_nfs was set, -1 if fstatfs is not available or errno if an
+// error occurred.
+int is_nfs_fd(int fd, bool* is_nfs);
+
 // Return whether `ch` is a directory separator, i.e. '/' on POSIX systems and
 // '/' or '\\' on Windows systems.
 inline bool
@@ -277,6 +306,11 @@ std::vector<std::string> split_into_strings(nonstd::string_view input,
 
 // Return true if prefix is a prefix of string.
 bool starts_with(nonstd::string_view string, nonstd::string_view prefix);
+
+// Returns a copy of string with the specified ANSI CSI sequences removed.
+[[gnu::warn_unused_result]] std::string
+strip_ansi_csi_seqs(nonstd::string_view string,
+                    nonstd::string_view strip_actions = "Km");
 
 // Strip whitespace from left and right side of a string.
 [[gnu::warn_unused_result]] std::string

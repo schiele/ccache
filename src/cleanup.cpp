@@ -21,12 +21,17 @@
 
 #include "CacheFile.hpp"
 #include "Config.hpp"
+#include "Context.hpp"
 #include "Util.hpp"
 #include "logging.hpp"
 #include "stats.hpp"
 
+#ifdef INODE_CACHE_SUPPORTED
+#  include "InodeCache.hpp"
+#endif
+
 #include <algorithm>
-#include <math.h>
+#include <cmath>
 
 static void
 delete_file(const std::string& path,
@@ -189,8 +194,11 @@ wipe_dir(const std::string& subdir,
 
 // Wipe all cached files in all subdirectories.
 void
-wipe_all(const Config& config, const Util::ProgressReceiver& progress_receiver)
+wipe_all(const Context& ctx, const Util::ProgressReceiver& progress_receiver)
 {
   Util::for_each_level_1_subdir(
-    config.cache_dir(), wipe_dir, progress_receiver);
+    ctx.config.cache_dir(), wipe_dir, progress_receiver);
+#ifdef INODE_CACHE_SUPPORTED
+  ctx.inode_cache.drop();
+#endif
 }

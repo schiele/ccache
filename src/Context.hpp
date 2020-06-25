@@ -29,6 +29,10 @@
 #include "ccache.hpp"
 #include "hash.hpp"
 
+#ifdef INODE_CACHE_SUPPORTED
+#  include "InodeCache.hpp"
+#endif
+
 #include "third_party/nonstd/optional.hpp"
 #include "third_party/nonstd/string_view.hpp"
 
@@ -56,9 +60,8 @@ public:
   // The original argument list.
   Args orig_args;
 
-  // Name (represented as a struct digest) of the file containing the cached
-  // result.
-  const struct digest& result_name() const;
+  // Name (represented as a hash) of the file containing the cached result.
+  const Digest& result_name() const;
 
   // Full path to the file containing the result
   // (cachedir/a/b/cdef[...]-size.result).
@@ -73,11 +76,13 @@ public:
   time_t time_of_compilation = 0;
 
   // Files included by the preprocessor and their hashes.
-  // Key: file path. Value: struct digest.
-  std::unordered_map<std::string, digest> included_files;
+  std::unordered_map<std::string, Digest> included_files;
 
   // Uses absolute path for some include files.
   bool has_absolute_include_headers = false;
+
+  // Have we tried and failed to get colored diagnostics?
+  bool diagnostics_color_failed = false;
 
   // The name of the temporary preprocessed file.
   std::string i_tmpfile;
@@ -85,9 +90,9 @@ public:
   // The name of the cpp stderr file.
   std::string cpp_stderr;
 
-  // Name (represented as a struct digest) of the file containing the manifest
-  // for the cached result.
-  const struct digest& manifest_name() const;
+  // Name (represented as a hash) of the file containing the manifest for the
+  // cached result.
+  const Digest& manifest_name() const;
 
   // The stats file to use for the manifest.
   const std::string& manifest_stats_file() const;
@@ -101,6 +106,11 @@ public:
 
   // Headers (or directories with headers) to ignore in manifest mode.
   std::vector<std::string> ignore_header_paths;
+
+#ifdef INODE_CACHE_SUPPORTED
+  // InodeCache that caches source file hashes when enabled.
+  mutable InodeCache inode_cache;
+#endif
 
   // Full path to the statistics file in the subdirectory where the cached
   // result belongs (<cache_dir>/<x>/stats).
@@ -121,18 +131,18 @@ public:
   std::unique_ptr<MiniTrace> mini_trace;
 #endif
 
-  void set_manifest_name(const struct digest& name);
-  void set_result_name(const struct digest& name);
+  void set_manifest_name(const Digest& name);
+  void set_result_name(const Digest& name);
 
   // Register a temporary file to remove at program exit.
   void register_pending_tmp_file(const std::string& path);
 
 private:
-  nonstd::optional<struct digest> m_manifest_name;
+  nonstd::optional<Digest> m_manifest_name;
   std::string m_manifest_path;
   std::string m_manifest_stats_file;
 
-  nonstd::optional<struct digest> m_result_name;
+  nonstd::optional<Digest> m_result_name;
   std::string m_result_path;
   mutable std::string m_result_stats_file;
 
@@ -147,13 +157,13 @@ private:
   void unlink_pending_tmp_files();
   void unlink_pending_tmp_files_signal_safe(); // called from signal handler
 
-  void set_path_and_stats_file(const struct digest& name,
+  void set_path_and_stats_file(const Digest& name,
                                nonstd::string_view suffix,
                                std::string& path_var,
-                               std::string& stats_file_var);
+                               std::string& stats_file_var) const;
 };
 
-inline const struct digest&
+inline const Digest&
 Context::manifest_name() const
 {
   return *m_manifest_name;
@@ -173,7 +183,7 @@ Context::manifest_stats_file() const
   return m_manifest_stats_file;
 }
 
-inline const struct digest&
+inline const Digest&
 Context::result_name() const
 {
   return *m_result_name;

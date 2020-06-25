@@ -22,7 +22,9 @@
 #include "Args.hpp"
 #include "ArgsInfo.hpp"
 #include "Context.hpp"
+#include "Fd.hpp"
 #include "File.hpp"
+#include "Finalizer.hpp"
 #include "FormatNonstdStringView.hpp"
 #include "MiniTrace.hpp"
 #include "ProgressBar.hpp"
@@ -54,9 +56,6 @@
 
 #include <fstream>
 #include <limits>
-
-#define STRINGIFY(x) #x
-#define TO_STRING(x) STRINGIFY(x)
 
 using nonstd::nullopt;
 using nonstd::optional;
@@ -107,7 +106,7 @@ Common options:
 Options for scripting or debugging:
         --dump-manifest PATH  dump manifest file at PATH in text format
     -k, --get-config KEY      print the value of configuration key KEY
-        --hash-file PATH      print the hash (160 bit BLAKE2b) of the file at
+        --hash-file PATH      print the hash (160 bit BLAKE3) of the file at
                               PATH
         --print-stats         print statistics counter IDs and corresponding
                               values in machine-parsable format
@@ -250,7 +249,6 @@ do_remember_include_file(Context& ctx,
                          bool system,
                          struct hash* depend_mode_hash)
 {
-  struct hash* fhash = nullptr;
   bool is_pch = false;
 
   if (path.length() >= 2 && path[0] == '<' && path[path.length() - 1] == '>') {
@@ -326,9 +324,8 @@ do_remember_include_file(Context& ctx,
   }
 
   // Let's hash the include file content.
-  std::unique_ptr<struct hash, decltype(&hash_free)> fhash_holder(hash_init(),
-                                                                  &hash_free);
-  fhash = fhash_holder.get();
+  struct hash* fhash = hash_init();
+  Finalizer fhash_finalizer([=] { hash_free(fhash); });
 
   is_pch = is_precompiled_header(path.c_str());
   if (is_pch) {
@@ -347,46 +344,28 @@ do_remember_include_file(Context& ctx,
       }
     }
 
-    if (!hash_file(fhash, path.c_str())) {
+    if (!hash_binary_file(ctx, fhash, path.c_str())) {
       return false;
     }
     hash_delimiter(cpp_hash, using_pch_sum ? "pch_sum_hash" : "pch_hash");
-    char pch_digest[DIGEST_STRING_BUFFER_SIZE];
-    hash_result_as_string(fhash, pch_digest);
-    hash_string(cpp_hash, pch_digest);
+    hash_string(cpp_hash, hash_result(fhash).to_string());
   }
 
   if (ctx.config.direct_mode()) {
     if (!is_pch) { // else: the file has already been hashed.
-      char* source = nullptr;
-      size_t size;
-      if (st.size() > 0) {
-        if (!read_file(path.c_str(), st.size(), &source, &size)) {
-          return false;
-        }
-      } else {
-        source = x_strdup("");
-        size = 0;
-      }
-
-      int result =
-        hash_source_code_string(ctx.config, fhash, source, size, path.c_str());
-      free(source);
+      int result = hash_source_code_file(ctx, fhash, path.c_str());
       if (result & HASH_SOURCE_CODE_ERROR
           || result & HASH_SOURCE_CODE_FOUND_TIME) {
         return false;
       }
     }
 
-    digest d;
-    hash_result_as_bytes(fhash, &d);
+    Digest d = hash_result(fhash);
     ctx.included_files.emplace(path, d);
 
     if (depend_mode_hash) {
       hash_delimiter(depend_mode_hash, "include");
-      char digest[DIGEST_STRING_BUFFER_SIZE];
-      digest_as_string(&d, digest);
-      hash_string(depend_mode_hash, digest);
+      hash_string(depend_mode_hash, d.to_string());
     }
   }
 
@@ -681,7 +660,7 @@ use_relative_paths_in_depfile(const Context& ctx)
 
 // Extract the used includes from the dependency file. Note that we cannot
 // distinguish system headers from other includes here.
-static struct digest*
+static optional<Digest>
 result_name_from_depfile(Context& ctx, struct hash* hash)
 {
   std::string file_content;
@@ -691,7 +670,7 @@ result_name_from_depfile(Context& ctx, struct hash* hash)
     cc_log("Cannot open dependency file %s: %s",
            ctx.args_info.output_dep.c_str(),
            e.what());
-    return nullptr;
+    return nullopt;
   }
 
   for (string_view token : Util::split_into_views(file_content, " \t\r\n")) {
@@ -719,19 +698,65 @@ result_name_from_depfile(Context& ctx, struct hash* hash)
     print_included_files(ctx, stdout);
   }
 
-  auto d = static_cast<digest*>(x_malloc(sizeof(digest)));
-  hash_result_as_bytes(hash, d);
-  return d;
+  return hash_result(hash);
+}
+
+// Execute the compiler/preprocessor, with logic to retry without requesting
+// colored diagnostics messages if that fails.
+static int
+execute(Context& ctx,
+        Args& args,
+        const std::string& stdout_path,
+        int stdout_fd,
+        const std::string& stderr_path,
+        int stderr_fd)
+{
+  if (ctx.diagnostics_color_failed
+      && ctx.guessed_compiler == GuessedCompiler::gcc) {
+    args.erase_with_prefix("-fdiagnostics-color");
+  }
+  int status =
+    execute(args.to_argv().data(), stdout_fd, stderr_fd, &ctx.compiler_pid);
+  if (status != 0 && !ctx.diagnostics_color_failed
+      && ctx.guessed_compiler == GuessedCompiler::gcc) {
+    auto errors = Util::read_file(stderr_path);
+    if (errors.find("unrecognized command-line option") != std::string::npos
+        && errors.find("-fdiagnostics-color") != std::string::npos) {
+      // Old versions of GCC did not support colored diagnostics.
+      cc_log("-fdiagnostics-color is unsupported; trying again without it");
+      if (ftruncate(stdout_fd, 0) < 0 || lseek(stdout_fd, 0, SEEK_SET) < 0) {
+        cc_log(
+          "Failed to truncate %s: %s", stdout_path.c_str(), strerror(errno));
+        failed(STATS_ERROR);
+      }
+      if (ftruncate(stderr_fd, 0) < 0 || lseek(stderr_fd, 0, SEEK_SET) < 0) {
+        cc_log(
+          "Failed to truncate %s: %s", stderr_path.c_str(), strerror(errno));
+        failed(STATS_ERROR);
+      }
+      ctx.diagnostics_color_failed = true;
+      return execute(ctx, args, stdout_path, stdout_fd, stderr_path, stderr_fd);
+    }
+  }
+  return status;
 }
 
 // Send cached stderr, if any, to stderr.
 static void
-send_cached_stderr(const char* path_stderr)
+send_cached_stderr(const std::string& path_stderr, bool strip_colors)
 {
-  int fd_stderr = open(path_stderr, O_RDONLY | O_BINARY);
-  if (fd_stderr != -1) {
-    copy_fd(fd_stderr, STDERR_FILENO);
-    close(fd_stderr);
+  if (strip_colors) {
+    try {
+      auto stripped = Util::strip_ansi_csi_seqs(Util::read_file(path_stderr));
+      write_fd(STDERR_FILENO, stripped.data(), stripped.size());
+    } catch (const Error&) {
+      // Fall through
+    }
+  } else {
+    Fd fd_stderr(open(path_stderr.c_str(), O_RDONLY | O_BINARY));
+    if (fd_stderr) {
+      copy_fd(*fd_stderr, STDERR_FILENO);
+    }
   }
 }
 
@@ -878,8 +903,8 @@ to_cache(Context& ctx,
 
   int status;
   if (!ctx.config.depend_mode()) {
-    status = execute(
-      args.to_argv().data(), tmp_stdout_fd, tmp_stderr_fd, &ctx.compiler_pid);
+    status =
+      execute(ctx, args, tmp_stdout, tmp_stdout_fd, tmp_stderr, tmp_stderr_fd);
     args.pop_back(3);
   } else {
     // Use the original arguments (including dependency options) in depend
@@ -890,10 +915,12 @@ to_cache(Context& ctx,
     add_prefix(ctx, depend_mode_args, ctx.config.prefix_command());
 
     ctx.time_of_compilation = time(nullptr);
-    status = execute(depend_mode_args.to_argv().data(),
+    status = execute(ctx,
+                     depend_mode_args,
+                     tmp_stdout,
                      tmp_stdout_fd,
-                     tmp_stderr_fd,
-                     &ctx.compiler_pid);
+                     tmp_stderr,
+                     tmp_stderr_fd);
   }
   MTR_END("execute", "compiler");
 
@@ -984,19 +1011,14 @@ to_cache(Context& ctx,
   if (status != 0) {
     cc_log("Compiler gave exit status %d", status);
 
-    int fd = open(tmp_stderr.c_str(), O_RDONLY | O_BINARY);
-    if (fd != -1) {
-      // We can output stderr immediately instead of rerunning the compiler.
-      copy_fd(fd, STDERR_FILENO);
-      close(fd);
-    }
+    // We can output stderr immediately instead of rerunning the compiler.
+    send_cached_stderr(tmp_stderr, ctx.args_info.strip_diagnostics_colors);
 
     failed(STATS_STATUS, status);
   }
 
   if (ctx.config.depend_mode()) {
-    struct digest* result_name =
-      result_name_from_depfile(ctx, depend_mode_hash);
+    auto result_name = result_name_from_depfile(ctx, depend_mode_hash);
     if (!result_name) {
       failed(STATS_ERROR);
     }
@@ -1084,12 +1106,12 @@ to_cache(Context& ctx,
   }
 
   // Everything OK.
-  send_cached_stderr(tmp_stderr.c_str());
+  send_cached_stderr(tmp_stderr, ctx.args_info.strip_diagnostics_colors);
 }
 
 // Find the result name by running the compiler in preprocessor mode and
 // hashing the result.
-static struct digest*
+static Digest
 get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
 {
   ctx.time_of_compilation = time(nullptr);
@@ -1131,8 +1153,7 @@ get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
     add_prefix(ctx, args, ctx.config.prefix_command_cpp());
     cc_log("Running preprocessor");
     MTR_BEGIN("execute", "preprocessor");
-    status =
-      execute(args.to_argv().data(), stdout_fd, stderr_fd, &ctx.compiler_pid);
+    status = execute(ctx, args, stdout_path, stdout_fd, stderr_path, stderr_fd);
     MTR_END("execute", "preprocessor");
     args.pop_back(args_added);
   }
@@ -1149,7 +1170,8 @@ get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
   }
 
   hash_delimiter(hash, "cppstderr");
-  if (!ctx.args_info.direct_i_file && !hash_file(hash, stderr_path.c_str())) {
+  if (!ctx.args_info.direct_i_file
+      && !hash_binary_file(ctx, hash, stderr_path.c_str())) {
     // Somebody removed the temporary file?
     cc_log("Failed to open %s: %s", stderr_path.c_str(), strerror(errno));
     failed(STATS_ERROR);
@@ -1174,9 +1196,7 @@ get_result_name_from_cpp(Context& ctx, Args& args, struct hash* hash)
     hash_string(hash, "false");
   }
 
-  auto name = static_cast<digest*>(x_malloc(sizeof(digest)));
-  hash_result_as_bytes(hash, name);
-  return name;
+  return hash_result(hash);
 }
 
 // Hash mtime or content of a file, or the output of a command, according to
@@ -1199,7 +1219,7 @@ hash_compiler(const Context& ctx,
     hash_string(hash, ctx.config.compiler_check().c_str() + strlen("string:"));
   } else if (ctx.config.compiler_check() == "content" || !allow_command) {
     hash_delimiter(hash, "cc_content");
-    hash_file(hash, path);
+    hash_binary_file(ctx, hash, path);
   } else { // command string
     if (!hash_multicommand_output(hash,
                                   ctx.config.compiler_check().c_str(),
@@ -1370,7 +1390,7 @@ hash_common_info(const Context& ctx,
   for (const auto& sanitize_blacklist : args_info.sanitize_blacklists) {
     cc_log("Hashing sanitize blacklist %s", sanitize_blacklist.c_str());
     hash_delimiter(hash, "sanitizeblacklist");
-    if (!hash_file(hash, sanitize_blacklist.c_str())) {
+    if (!hash_binary_file(ctx, hash, sanitize_blacklist.c_str())) {
       failed(STATS_BADEXTRAFILE);
     }
   }
@@ -1380,7 +1400,7 @@ hash_common_info(const Context& ctx,
            ctx.config.extra_files_to_hash(), PATH_DELIM)) {
       cc_log("Hashing extra file %s", path.c_str());
       hash_delimiter(hash, "extrafile");
-      if (!hash_file(hash, path.c_str())) {
+      if (!hash_binary_file(ctx, hash, path.c_str())) {
         failed(STATS_BADEXTRAFILE);
       }
     }
@@ -1424,7 +1444,7 @@ hash_profile_data_file(const Context& ctx, struct hash* hash)
     if (st && !st.is_directory()) {
       cc_log("Adding profile data %s to the hash", p.c_str());
       hash_delimiter(hash, "-fprofile-use");
-      if (hash_file(hash, p.c_str())) {
+      if (hash_binary_file(ctx, hash, p.c_str())) {
         found = true;
       }
     }
@@ -1436,7 +1456,7 @@ hash_profile_data_file(const Context& ctx, struct hash* hash)
 // Update a hash sum with information specific to the direct and preprocessor
 // modes and calculate the result name. Returns the result name on success,
 // otherwise NULL. Caller frees.
-static struct digest*
+static optional<Digest>
 calculate_result_name(Context& ctx,
                       const Args& args,
                       Args& preprocessor_args,
@@ -1643,7 +1663,7 @@ calculate_result_name(Context& ctx,
     hash_string(hash, arch);
   }
 
-  struct digest* result_name = nullptr;
+  optional<Digest> result_name;
   if (direct_mode) {
     // Hash environment variables that affect the preprocessor output.
     const char* envvars[] = {"CPATH",
@@ -1676,19 +1696,17 @@ calculate_result_name(Context& ctx,
 
     hash_delimiter(hash, "sourcecode");
     int result =
-      hash_source_code_file(ctx.config, hash, ctx.args_info.input_file.c_str());
+      hash_source_code_file(ctx, hash, ctx.args_info.input_file.c_str());
     if (result & HASH_SOURCE_CODE_ERROR) {
       failed(STATS_ERROR);
     }
     if (result & HASH_SOURCE_CODE_FOUND_TIME) {
       cc_log("Disabling direct mode");
       ctx.config.set_direct_mode(false);
-      return nullptr;
+      return nullopt;
     }
 
-    struct digest manifest_name;
-    hash_result_as_bytes(hash, &manifest_name);
-    ctx.set_manifest_name(manifest_name);
+    ctx.set_manifest_name(hash_result(hash));
 
     cc_log("Looking for result name in %s", ctx.manifest_path().c_str());
     MTR_BEGIN("manifest", "manifest_get");
@@ -1711,8 +1729,7 @@ calculate_result_name(Context& ctx,
         cc_log("Got result name from preprocessor with -arch %s",
                ctx.args_info.arch_args[i].c_str());
         if (i != ctx.args_info.arch_args.size() - 1) {
-          free(result_name);
-          result_name = nullptr;
+          result_name = nullopt;
         }
         preprocessor_args.pop_back();
       }
@@ -1789,7 +1806,7 @@ from_cache(Context& ctx, enum fromcache_call_mode mode)
 
   MTR_END("file", "file_get");
 
-  send_cached_stderr(tmp_stderr.c_str());
+  send_cached_stderr(tmp_stderr, ctx.args_info.strip_diagnostics_colors);
 
   cc_log("Succeeded getting cached result");
 
@@ -1891,8 +1908,7 @@ set_up_config(Config& config)
   if (p) {
     config.set_primary_config_path(p);
   } else {
-    config.set_secondary_config_path(
-      fmt::format("{}/ccache.conf", TO_STRING(SYSCONFDIR)));
+    config.set_secondary_config_path(fmt::format("{}/ccache.conf", SYSCONFDIR));
     MTR_BEGIN("config", "conf_read_secondary");
     // A missing config file in SYSCONFDIR is OK so don't check return value.
     config.update_from_file(config.secondary_config_path());
@@ -2171,8 +2187,8 @@ do_cache_compilation(Context& ctx, const char* const* argv)
   args_to_hash.push_back(extra_args_to_hash);
 
   bool put_result_in_manifest = false;
-  struct digest* result_name = nullptr;
-  struct digest* result_name_from_manifest = nullptr;
+  optional<Digest> result_name;
+  optional<Digest> result_name_from_manifest;
   if (ctx.config.direct_mode()) {
     cc_log("Trying direct lookup");
     MTR_BEGIN("hash", "direct_hash");
@@ -2225,8 +2241,7 @@ do_cache_compilation(Context& ctx, const char* const* argv)
     }
     ctx.set_result_name(*result_name);
 
-    if (result_name_from_manifest
-        && !digests_equal(result_name_from_manifest, result_name)) {
+    if (result_name_from_manifest && result_name_from_manifest != result_name) {
       // The hash from manifest differs from the hash of the preprocessor
       // output. This could be because:
       //
@@ -2332,9 +2347,7 @@ handle_main_options(int argc, const char* const* argv)
       } else {
         hash_file(hash, optarg);
       }
-      char digest[DIGEST_STRING_BUFFER_SIZE];
-      hash_result_as_string(hash, digest);
-      puts(digest);
+      puts(hash_result(hash).to_string().c_str());
       hash_free(hash);
       break;
     }
@@ -2357,8 +2370,7 @@ handle_main_options(int argc, const char* const* argv)
     case 'C': // --clear
     {
       ProgressBar progress_bar("Clearing...");
-      wipe_all(ctx.config,
-               [&](double progress) { progress_bar.update(progress); });
+      wipe_all(ctx, [&](double progress) { progress_bar.update(progress); });
       if (isatty(STDOUT_FILENO)) {
         printf("\n");
       }
@@ -2419,7 +2431,7 @@ handle_main_options(int argc, const char* const* argv)
       break;
 
     case 's': // --show-stats
-      stats_summary(ctx.config);
+      stats_summary(ctx);
       break;
 
     case 'V': // --version
@@ -2456,7 +2468,7 @@ handle_main_options(int argc, const char* const* argv)
     }
 
     case 'z': // --zero-stats
-      stats_zero(ctx.config);
+      stats_zero(ctx);
       printf("Statistics zeroed\n");
       break;
 

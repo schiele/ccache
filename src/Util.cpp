@@ -21,14 +21,24 @@
 #include "Config.hpp"
 #include "Context.hpp"
 #include "FormatNonstdStringView.hpp"
+#include "legacy_util.hpp"
 #include "logging.hpp"
+
+#include <algorithm>
+#include <fstream>
+#include <regex>
+
+#ifdef HAVE_LINUX_FS_H
+#  include <linux/magic.h>
+#  include <sys/statfs.h>
+#elif defined(HAVE_STRUCT_STATFS_F_FSTYPENAME)
+#  include <sys/mount.h>
+#  include <sys/param.h>
+#endif
 
 #ifdef _WIN32
 #  include "win32compat.hpp"
 #endif
-
-#include <algorithm>
-#include <fstream>
 
 using nonstd::string_view;
 
@@ -181,10 +191,65 @@ dir_name(string_view path)
   }
 }
 
+std::string
+edit_ansi_csi_seqs(string_view string, const SubstringEditor& editor)
+{
+  static const std::regex csi_regex(
+    "\x1B\\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]");
+  std::string ret;
+  std::string substr;
+  ret.reserve(string.size());
+  for (std::cregex_token_iterator itr(
+         string.begin(), string.end(), csi_regex, {-1, 0});
+       itr != std::cregex_token_iterator{};
+       ++itr) {
+    ret.append(itr->first, itr->second);
+    if (++itr == std::cregex_token_iterator{}) {
+      break;
+    }
+    substr.assign(itr->first, itr->second);
+    editor(itr->first - string.begin(), substr);
+    ret.append(substr);
+  }
+  return ret;
+}
+
 bool
 ends_with(string_view string, string_view suffix)
 {
   return string.ends_with(suffix);
+}
+
+int
+fallocate(int fd, long new_size)
+{
+#ifdef HAVE_POSIX_FALLOCATE
+  return posix_fallocate(fd, 0, new_size);
+#else
+  off_t saved_pos = lseek(fd, 0, SEEK_END);
+  off_t old_size = lseek(fd, 0, SEEK_END);
+  if (old_size == -1) {
+    int err = errno;
+    lseek(fd, saved_pos, SEEK_SET);
+    return err;
+  }
+  if (old_size >= new_size) {
+    lseek(fd, saved_pos, SEEK_SET);
+    return 0;
+  }
+  long bytes_to_write = new_size - old_size;
+  void* buf = calloc(bytes_to_write, 1);
+  if (!buf) {
+    lseek(fd, saved_pos, SEEK_SET);
+    return ENOMEM;
+  }
+  int err = 0;
+  if (!write_fd(fd, buf, bytes_to_write))
+    err = errno;
+  lseek(fd, saved_pos, SEEK_SET);
+  free(buf);
+  return err;
+#endif
 }
 
 void
@@ -201,6 +266,17 @@ for_each_level_1_subdir(const std::string& cache_dir,
     });
   }
   progress_receiver(1.0);
+}
+
+std::string
+format_hex(const uint8_t* data, size_t size)
+{
+  std::string result;
+  result.reserve(2 * size);
+  for (size_t i = 0; i < size; i++) {
+    result += fmt::format("{:02x}", data[i]);
+  }
+  return result;
 }
 
 std::string
@@ -386,6 +462,29 @@ is_absolute_path(string_view path)
   return !path.empty() && path[0] == '/';
 }
 
+#if defined(HAVE_LINUX_FS_H) || defined(HAVE_STRUCT_STATFS_F_FSTYPENAME)
+int
+is_nfs_fd(int fd, bool* is_nfs)
+{
+  struct statfs buf;
+  if (fstatfs(fd, &buf) != 0) {
+    return errno;
+  }
+#  ifdef HAVE_LINUX_FS_H
+  *is_nfs = buf.f_type == NFS_SUPER_MAGIC;
+#  else // Mac OS X and some other BSD flavors
+  *is_nfs = strcmp(buf.f_fstypename, "nfs") == 0;
+#  endif
+  return 0;
+}
+#else
+int
+is_nfs_fd([[gnu::unused]] int fd, [[gnu::unused]] bool* is_nfs)
+{
+  return -1;
+}
+#endif
+
 std::string
 make_relative_path(const Context& ctx, string_view path)
 {
@@ -564,7 +663,7 @@ real_path(const std::string& path, bool return_empty_on_error)
   char* buffer = managed_buffer.get();
   char* resolved = nullptr;
 
-#if HAVE_REALPATH
+#ifdef HAVE_REALPATH
   resolved = realpath(c_path, buffer);
 #elif defined(_WIN32)
   if (c_path[0] == '/') {
@@ -578,13 +677,12 @@ real_path(const std::string& path, bool return_empty_on_error)
                                   FILE_ATTRIBUTE_NORMAL,
                                   NULL);
   if (INVALID_HANDLE_VALUE != path_handle) {
-#  ifdef HAVE_GETFINALPATHNAMEBYHANDLEW
-    GetFinalPathNameByHandle(
+    bool ok = GetFinalPathNameByHandle(
       path_handle, buffer, buffer_size, FILE_NAME_NORMALIZED);
-#  else
-    GetFileNameFromHandle(path_handle, buffer, buffer_size);
-#  endif
     CloseHandle(path_handle);
+    if (!ok) {
+      return path;
+    }
     resolved = buffer + 4; // Strip \\?\ from the file name.
   } else {
     snprintf(buffer, buffer_size, "%s", c_path);
@@ -612,21 +710,32 @@ remove_extension(string_view path)
 }
 
 std::vector<string_view>
-split_into_views(string_view s, const char* separators)
+split_into_views(string_view input, const char* separators)
 {
-  return split_at<string_view>(s, separators);
+  return split_at<string_view>(input, separators);
 }
 
 std::vector<std::string>
-split_into_strings(string_view s, const char* separators)
+split_into_strings(string_view input, const char* separators)
 {
-  return split_at<std::string>(s, separators);
+  return split_at<std::string>(input, separators);
 }
 
 bool
 starts_with(string_view string, string_view prefix)
 {
   return string.starts_with(prefix);
+}
+
+std::string
+strip_ansi_csi_seqs(string_view string, string_view strip_actions)
+{
+  return edit_ansi_csi_seqs(
+    string, [=](string_view::size_type /*pos*/, std::string& substr) {
+      if (strip_actions.find(substr.back()) != string_view::npos) {
+        substr.clear();
+      }
+    });
 }
 
 std::string
